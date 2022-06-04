@@ -10,6 +10,7 @@
 
 int begin_port, end_port;
 struct in_addr dest_ip;
+char source_ip[20];
 
 int 
 main(int argc, char *argv[]) {
@@ -18,7 +19,6 @@ main(int argc, char *argv[]) {
 
 
   char datagram[DATAGRAM_SIZE];
-  char source_ip[20];
 
   struct sockaddr_in dest;
   struct psd_header psh;
@@ -28,9 +28,14 @@ main(int argc, char *argv[]) {
   int sock = socket(PF_INET, SOCK_RAW, IPPROTO_TCP);
   if (sock < 0) {
     fprintf(stderr, "Failed to open a raw socket: %s\n", strerror(errno));
-    exit(-1);
+    fprintf(stderr, "\033[;31mPlease check if you have sudo permission\033[0m\n");
+    exit(1);
   }
 
+  if (get_local_ip(source_ip) == NULL) {
+    fprintf(stderr, "Failed to get local's ip: %s\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
   set_datagram(datagram, source_ip);
 
   const int yes = 1;
@@ -53,7 +58,6 @@ main(int argc, char *argv[]) {
                     + sizeof(tcp_max_segment_option);
   tcph = (struct tcphdr*)(datagram + sizeof(struct ip));
 
-  puts("开始发送数据");
   for (unsigned port = begin_port, cnt = 1; port <= end_port; ++port, ++cnt) {
     if (cnt % 1000 == 0) {
       sleep(1);
@@ -84,8 +88,6 @@ main(int argc, char *argv[]) {
 
 char*
 get_default_dev(char *errbuf) {
-  char local_ip[20];
-  get_local_ip(local_ip);
   pcap_if_t *alldevs;
   if (pcap_findalldevs(&alldevs, errbuf) == -1) {
     return NULL;
@@ -94,28 +96,35 @@ get_default_dev(char *errbuf) {
   for (pcap_if_t *dev = alldevs; dev != NULL; dev = dev->next) {
     for (pcap_addr_t *t = dev->addresses; t != NULL; t = t->next) {
       char *dev_ip = inet_ntoa(((struct sockaddr_in *)t->addr)->sin_addr);
-      if (t->addr->sa_family == PF_INET && strcmp(local_ip, dev_ip) == 0) {
+      if (t->addr->sa_family == PF_INET && strcmp(source_ip, dev_ip) == 0) {
+        printf("Source: %s\nInterface: %s\n\n", source_ip, dev->name);
+
         return dev->name;
       }
     }
   }
 
-  sprintf(errbuf, "No device's ip address is %s", local_ip);
+  sprintf(errbuf, "No device's ip address is %s", source_ip);
 
   return NULL;
 }
 
 void *
 receive_packet(void *count) {
-  printf("There will send %d packet(s)\n", *(int*)count);
   char errbuf[PCAP_ERRBUF_SIZE];
   char *dev;
+  int ret;
   pcap_t *handle;
+  struct pcap_pkthdr *header;
+  const u_char *packet;
   struct bpf_program fp;
   bpf_u_int32 mask,
               net;
 
+  time_t sniff_time_range;
+  time_t sniff_end_time;
   char filter_exp[24];
+
   if (sprintf(filter_exp, "src host %s", inet_ntoa(dest_ip)) < 0) {
     fprintf(stderr, "Error get filter_exp: %s\n", strerror(errno));
     exit(EXIT_FAILURE);
@@ -133,8 +142,8 @@ receive_packet(void *count) {
     mask = 0;
   }
 
-  time_t time = (end_port - begin_port + 999) / 1000 * 1000 + 2000;
-  handle = pcap_open_live(dev, BUFSIZ, 1, time, errbuf);
+  sniff_time_range = (end_port - begin_port + 999) / 1000 + 2;
+  handle = pcap_open_live(dev, BUFSIZ, 1, sniff_time_range, errbuf);
 
   if (handle == NULL) {
     fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
@@ -151,18 +160,32 @@ receive_packet(void *count) {
     exit(EXIT_FAILURE);
   }
 
-  pcap_dispatch(handle, *(int*)count, start_sniffer, NULL);
+  if (pcap_setnonblock(handle, 0, errbuf) == -1) {
+    fprintf(stderr, "Failed to set nonbloc mode: %s.", errbuf);
+  }
+
+  sniff_end_time = sniff_time_range + time(0);
+
+  while (time(0) < sniff_end_time) {
+    if ((ret = pcap_next_ex(handle, &header, &packet)) > 0) {
+      start_sniffer(header, packet);
+    }
+    else if (ret < 0) {
+      fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(handle));
+      return NULL;
+    }
+  }
+
 
   pcap_freecode(&fp);
   pcap_close(handle);
-  puts("Stop Receive.");
+  puts("\nFinish.");
 
   return NULL;
 }
 
 void
-start_sniffer(unsigned char *args, 
-              const struct pcap_pkthdr *header, const u_char *packet) {
+start_sniffer(const struct pcap_pkthdr *header, const u_char *packet) {
 
   const struct ip *iph = (struct ip*)(packet + 14);
   const struct tcphdr* tcph = (struct tcphdr*)(packet + 14 + sizeof(struct ip));
@@ -186,8 +209,6 @@ set_datagram(void *datagram, char *s_ip) {
   // TCP Option
   tcp_max_segment_option *opt = 
     (tcp_max_segment_option*)(d + sizeof(struct ip) + sizeof(struct tcphdr));
-
-  get_local_ip(s_ip);
   
   // set IP Header 
   iph->ip_hl  = 5;
@@ -264,7 +285,7 @@ end:
   return NULL;
 }
 
-int 
+const char *
 get_local_ip(char *buffer) {
   int sock = socket(PF_INET, SOCK_DGRAM, 0);
 
@@ -279,7 +300,7 @@ get_local_ip(char *buffer) {
 
   if (connect(sock, (struct sockaddr*)&serv, sizeof(serv)) < 0) {
     fprintf(stderr, "Failed to connect to %s: %s\n", dns, strerror(errno));
-    return -1;
+    return NULL;
   }
 
   struct sockaddr_in name;
@@ -287,13 +308,11 @@ get_local_ip(char *buffer) {
 
   if (getsockname(sock, (struct sockaddr *)&name, &name_len) < 0) {
     fprintf(stderr, "Failed to get sock's name\n");
-    return -1;
+    return NULL;
   }
-  
-  const char *p = inet_ntop(PF_INET, &name.sin_addr, buffer, 100);
-  printf("localhost's ip is %s\n", p);
   close(sock);
-  return 1;
+  
+  return inet_ntop(PF_INET, &name.sin_addr, buffer, 100);
 }
 
 void 
@@ -314,12 +333,11 @@ deal_args(int argc, char **argv) {
   target = argv[1];
   if (inet_addr(target) != -1) {
     dest_ip.s_addr = inet_addr(target);
-    printf("target is: %s\n", target);
+    printf("Target: %s\n", target);
   } else {
     char *ip = hostname_to_ip(target);
     if (ip != NULL) {
-      // printf("target %s resolved to %s\n", target, ip);
-      printf("target is: %s(%s)\n", target, ip);
+      printf("Target: %s(%s)\n", target, ip);
       dest_ip.s_addr = inet_addr(ip);
     }
     else {
@@ -348,9 +366,9 @@ deal_args(int argc, char **argv) {
         exit(2);
       }
       
-      int l = atoi(argv[2]), r = atoi(argv[3]);
+      const int l = atoi(argv[2]), r = atoi(argv[3]);
       if (atoi(argv[2]) > atoi(argv[3])) {
-        fprintf(stderr, "Invalid port range: [%d-%d]\n", l, r);
+        fprintf(stderr, "Invalid port range: [%d - %d]\n", l, r);
         exit(2);
       }
       else {
