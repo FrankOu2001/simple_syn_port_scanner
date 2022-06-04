@@ -14,11 +14,11 @@
 unsigned short csum(unsigned short *, int);
 char *hostname_to_ip(char *);
 char* get_default_dev(char *);
-int get_local_ip(char *);
+const char *get_local_ip(char *);
 void set_datagram(void *, char *);
 void *receive_packet(void*);
 void deal_args(int argc, char **argv);
-void start_sniffer(unsigned char*, const struct pcap_pkthdr *, const u_char *);
+void start_sniffer(const struct pcap_pkthdr *, const u_char *);
  
 typedef struct max_segment_options {
   unsigned char   kind;
